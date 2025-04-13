@@ -1,28 +1,15 @@
 from PyQt5 import QtWidgets, QtCore, QtGui
+import pyqtgraph as pg
+from pyqtgraph import PlotWidget, DateAxisItem
 import sys
-import json
-import os
+from datetime import datetime
+from statsmodels.tsa.arima.model import ARIMA
+import numpy as np
 
-from api.requests import login
-from api.requests import register
-from api.requests import get_user_profile
+from utils.token_functions import load_token, save_token, TOKEN_FILE
+# from utils.graph_functions import draw_graph
 
-TOKEN_FILE = "client/token.json"
-
-def save_token(token):
-    os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
-    with open(TOKEN_FILE, "w") as token_file:
-        json.dump({"token": token}, token_file)
-    print("Токен сохранен: ", token)
-
-def load_token():
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, "r") as token_file:
-            data = json.load(token_file)
-            return data.get("token")
-    else:
-        save_token("")
-        return None
+from api.requests import login, register, get_asset_history, get_user_profile
 
 class LoginWindow(QtWidgets.QWidget):
     def __init__(self):
@@ -220,8 +207,152 @@ class RegisterWindow(QtWidgets.QWidget):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Анализ временных рядов')
-        self.setGeometry(100, 100, 800, 600)
+
+        self.last_graph_data = None
+
+        self.setWindowTitle('Анализ графиков')
+        self.setGeometry(100, 100, 1200, 700)
+
+        central_widget = QtWidgets.QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QtWidgets.QVBoxLayout()
+        central_widget.setLayout(main_layout)
+
+        header_layout = QtWidgets.QHBoxLayout()
+
+        self.title_label = QtWidgets.QLabel("Анализ графиков")
+        self.title_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.title_label.setStyleSheet("font-size: 24px; font-weight: bold;")
+
+        header_spacer = QtWidgets.QWidget()
+        header_spacer.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+
+        self.profile_button = QtWidgets.QPushButton("Профиль")
+        self.logout_button = QtWidgets.QPushButton("Выход")
+
+        header_layout.addWidget(self.title_label)
+        header_layout.addWidget(header_spacer)
+        header_layout.addWidget(self.profile_button)
+        header_layout.addWidget(self.logout_button)
+
+        search_layout = QtWidgets.QHBoxLayout()
+        self.search_input = QtWidgets.QLineEdit()
+        self.search_input.setPlaceholderText("Введите тикер актива (например: AAPL, BTC-USD)")
+        self.search_button = QtWidgets.QPushButton("Показать график")
+        self.search_button.clicked.connect(self.draw_graph)
+
+        search_layout.addWidget(self.search_input)
+        search_layout.addWidget(self.search_button)
+
+        content_layout = QtWidgets.QHBoxLayout()
+
+        axis = DateAxisItem(orientation='bottom')
+        self.graph_area = pg.PlotWidget(axisItems={'bottom': axis})
+        self.graph_area.setBackground("w")
+        self.graph_area.setTitle("График актива", color="k", size="16pt")
+        self.graph_area.setLabel("left", "Цена", color="k", size="14pt")
+        self.graph_area.setLabel("bottom", "Время", color="k", size="14pt")
+        self.graph_area.showGrid(x=True, y=True)
+        self.graph_area.setMinimumSize(1000, 500)
+        self.graph_area.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+        right_panel = QtWidgets.QVBoxLayout()
+
+        self.indicator_label = QtWidgets.QLabel("Выберите индикатор:")
+        self.indicator_combo = QtWidgets.QComboBox()
+        self.indicator_combo.addItems(["SMA", "EMA", "RSI", "MACD"])
+        self.indicator_button = QtWidgets.QPushButton("Вывести индикатор")
+        self.indicator_clear_button = QtWidgets.QPushButton("Очистить индикатор")
+
+        self.model_label = QtWidgets.QLabel("Выберите модель прогноза:")
+        self.model_combo = QtWidgets.QComboBox()
+        self.model_combo.addItems(["SMA-прогноз", "ARIMA", "Linear Regression", "LSTM (позже)"])
+        self.model_button = QtWidgets.QPushButton("Отобразить прогноз")
+        self.model_button.clicked.connect(self.draw_arima_forecast)
+        self.model_clear_button = QtWidgets.QPushButton("Очистить прогноз")
+
+        right_panel.addWidget(self.indicator_label)
+        right_panel.addWidget(self.indicator_combo)
+        right_panel.addWidget(self.indicator_button)
+        right_panel.addWidget(self.indicator_clear_button)
+        right_panel.addSpacing(30)
+        right_panel.addWidget(self.model_label)
+        right_panel.addWidget(self.model_combo)
+        right_panel.addWidget(self.model_button)
+        right_panel.addWidget(self.model_clear_button)
+        right_panel.addStretch()
+
+        content_layout.addWidget(self.graph_area, 3)
+        content_layout.addLayout(right_panel, 1)
+
+        main_layout.addLayout(header_layout)
+        main_layout.addSpacing(10)
+        main_layout.addLayout(search_layout)
+        main_layout.addSpacing(20)
+        main_layout.addLayout(content_layout)
+
+    def draw_graph(self):
+        symbol = self.search_input.text().strip()
+        if not symbol:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Введите тикер актива")
+            return
+
+        data = get_asset_history(symbol)
+        if not data:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", f"Нет или недостаточно данных для {symbol}")
+            return
+
+        x = [datetime.fromisoformat(point["timestamp"]).timestamp() for point in data]
+        y = [point["close"] for point in data]
+
+        self.last_graph_data = {"x": x, "y": y}
+
+        self.graph_area.clear()
+        self.graph_area.plot(
+            x,
+            y,
+            pen=pg.mkPen(color="b", width=2)
+        )
+
+        self.graph_area.setTitle(f"График {symbol.upper()}", color="k", size="16pt")
+
+    def predict_arima(self, y_values, last_x):
+        if len(y_values) < 30:
+            QtWidgets.QMessageBox.warning(self, "Недостаточно данных", "Для прогноза необходимо минимум 30 точек.")
+            return [], []
+
+        try:
+            model = ARIMA(y_values, order=(2, 1, 2))
+            model_fit = model.fit()
+
+            forecast = model_fit.forecast(steps=5)
+            last_date = last_x[-1]
+
+            # Генерация новых дат
+            interval_sec = last_x[-1] - last_x[-2]  # разница между точками
+            x_pred = [last_date + (i + 1) * interval_sec for i in range(5)]
+
+            return x_pred, forecast.tolist()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ошибка ARIMA", str(e))
+            return [], []
+
+    def draw_arima_forecast(self):
+        if not hasattr(self, "last_graph_data"):
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Сначала отобразите график.")
+            return
+
+        x = self.last_graph_data["x"]
+        y = self.last_graph_data["y"]
+
+        x_pred, y_pred = self.predict_arima(y, x)
+        if x_pred and y_pred:
+            self.graph_area.plot(
+                x_pred,
+                y_pred,
+                pen=pg.mkPen(color="g", style=QtCore.Qt.DashLine, width=2),
+                name="Прогноз"
+            )
 
 class ProfileWindow(QtWidgets.QWidget):
     def __init__(self):
@@ -249,6 +380,6 @@ class ProfileWindow(QtWidgets.QWidget):
 
 if __name__ == '__main__':
     app = QtWidgets.QApplication(sys.argv)
-    window = LoginWindow()
+    window = MainWindow()
     window.show()
     sys.exit(app.exec_())
