@@ -30,5 +30,5 @@ def token_required(f):
 
 @profile_blueprint.route("/profile", methods=["GET"])
 @token_required
-def user_profile():
+def user_profile(current_user):
     return jsonify({"message": f"Добро пожаловать, {current_user}"}), 200

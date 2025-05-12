@@ -3,6 +3,7 @@ from flask import Blueprint, jsonify, request
 import yfinance as yf
 from datetime import datetime, timedelta
 import pandas as pd
+import math
 
 from server.db import get_db_connection
 from server.routes.auth import token_required
@@ -77,43 +78,121 @@ def latest_price(symbol):
 # @token_required
 # def get_asset_history(current_user, symbol):
 def get_asset_history(symbol):
+    interval = request.args.get("interval", "1d")
+    start_str = request.args.get("start")
+    end_str = request.args.get("end")
+
+    today = datetime.today()
+
+    ticker = yf.Ticker(symbol)
+    ticker_found = True
+    data_frame = None
+
     try:
-        interval = request.args.get("interval", "1d")
-        start_str = request.args.get("start")
-        end_str = request.args.get("end")
+        data_frame = ticker.history(period="max")
+    except Exception as e:
+        ticker_found = False
+        print("Тикер не найден: " + str(e))
 
-        end_date = datetime.today()
-        start_date = end_date - timedelta(days=90)
+    if ticker_found and not data_frame.empty:
+        last_row = data_frame.iloc[-1]
 
-        if start_str:
-            start_date = datetime.strptime(start_str, "%Y-%m-%d")
+        check_moex = False
+        if (math.isnan(last_row["Open"]) and math.isnan(last_row["High"]) and math.isnan(last_row["Low"])
+                and math.isnan(last_row["Close"]) and last_row["Volume"] == 0):
+            check_moex = True
 
-        if end_str:
-            end_date = datetime.strptime(end_str, "%Y-%m-%d")
+        if not check_moex:
+            first_date = data_frame.index[0].to_pydatetime()
 
-        ticker = yf.Ticker(symbol)
-        data_frame = ticker.history(interval=interval, start=start_date, end=end_date)
+            if start_str and end_str:
+                start_date = datetime.strptime(start_str, "%Y-%m-%d")
+                end_date = datetime.strptime(end_str, "%Y-%m-%d")
+            else:
+                start_date = first_date
+                end_date = today
 
-        if not data_frame.empty:
-            data = []
-            for index, row in data_frame.iterrows():
-                data.append({
-                    "timestamp": index.isoformat(),
-                    "open": row["Open"],
-                    "high": row["High"],
-                    "low": row["Low"],
-                    "close": row["Close"],
-                    "volume": row["Volume"]
-                })
+            if start_date.date() != first_date.date() or end_date.date() != today.date():
+                if start_date.date() < first_date.date():
+                    return jsonify({
+                        "error":
+                            f"Дата начала торгов для {symbol} — {first_date.date()}. Вы выбрали слишком раннюю дату."
+                    }), 400
 
+                if start_date.date() > end_date.date():
+                    return jsonify({
+                        "error": f"Начальная дата не может быть позже конечной даты."
+                    }), 400
+
+                if end_date.date() > today.date():
+                    return jsonify({
+                        "error": f"Конечная дата не может быть позже сегодняшнего дня {today.date()}."
+                    }), 400
+
+                data_frame = ticker.history(interval=interval, start=start_date.date(), end=end_date.date())
+
+            if not data_frame.empty:
+                data = []
+                for index, row in data_frame.iterrows():
+                    data.append({
+                        "timestamp": index.isoformat(),
+                        "open": float(row["Open"]),
+                        "high": float(row["High"]),
+                        "low": float(row["Low"]),
+                        "close": float(row["Close"]),
+                        "volume": float(row["Volume"])
+                    })
+
+                return jsonify({
+                    "symbol": symbol,
+                    "interval": interval,
+                    "source": "Yahoo Finance",
+                    "data": data
+                }), 200
+
+    moex_symbol = convert_to_moex_symbol(symbol)
+    moex_url = f"https://iss.moex.com/iss/history/engines/stock/markets/shares/securities/{moex_symbol}.json"
+
+    moex_response = requests.get(moex_url, timeout=5)
+    if moex_response.status_code != 200:
+        return jsonify({"error": "MOEX API недоступен"}), 502
+
+    moex_data = moex_response.json()
+    rows = moex_data.get("history", {}).get("data", [])
+    columns = moex_data.get("history", {}).get("columns", [])
+
+    if not rows or not columns:
+        print("Ошибка здесь")
+        return jsonify({"error": f"Нет данных по тикеру {symbol}."}), 404
+
+    col_map = {name: idx for idx, name in enumerate(columns)}
+
+    dates = [datetime.strptime(row[col_map["TRADEDATE"]], "%Y-%m-%d") for row in rows]
+    first_moex_date = min(dates)
+
+    if start_str and end_str:
+        start_date = datetime.strptime(start_str, "%Y-%m-%d")
+        end_date = datetime.strptime(end_str, "%Y-%m-%d")
+    else:
+        start_date = first_moex_date
+        end_date = today
+
+    if start_date.date() != first_moex_date.date() or end_date.date() != today.date():
+        if start_date.date() < first_moex_date.date():
             return jsonify({
-                "symbol": symbol,
-                "interval": interval,
-                "data": data
-            }), 200
+                "error":
+                f"Дата начала торгов для {symbol} на MOEX — {first_moex_date.date()}. Вы выбрали слишком раннюю дату."
+            }), 400
 
-        moex_symbol = convert_to_moex_symbol(symbol)
-        moex_url = f"https://iss.moex.com/iss/history/engines/stock/markets/shares/securities/{moex_symbol}.json"
+        if start_date.date() > end_date.date():
+            return jsonify({
+                "error": f"Начальная дата не может быть позже конечной даты."
+            }), 400
+
+        if end_date.date() > today.date():
+            return jsonify({
+                "error": f"Конечная дата не может быть позже сегодняшнего дня {today.date()}."
+            }), 400
 
         params = {
             "from": start_date.strftime("%Y-%m-%d"),
@@ -121,37 +200,34 @@ def get_asset_history(symbol):
             "interval": 24
         }
 
-        response = requests.get(moex_url, params=params, timeout=5)
-        if response.status_code != 200:
-            return jsonify({"error": "MOEX API недоступен"}), 502
+        moex_filtered_response = requests.get(moex_url, params=params, timeout=5)
+        if moex_filtered_response.status_code != 200:
+            return jsonify({"error": "MOEX API недоступен (фильтр)"}), 502
 
-        moex_data = response.json()
+        moex_data = moex_filtered_response.json()
+
         rows = moex_data.get("history", {}).get("data", [])
-        columns = moex_data.get("history", {}).get("columns", [])
+        if not rows:
+            print("Ошибка здесь 1")
+            return jsonify({"error": "Нет данных за выбранный период"}), 404
 
-        if not rows or not columns:
-            return jsonify({"error": f"Ничего не найдено для {symbol}"}), 404
+    data = []
+    for row in rows:
+        data.append({
+            "timestamp": row[col_map["TRADEDATE"]],
+            "open": float(row[col_map["OPEN"]]),
+            "high": float(row[col_map["HIGH"]]),
+            "low": float(row[col_map["LOW"]]),
+            "close": float(row[col_map["CLOSE"]]),
+            "volume": float(row[col_map["VOLUME"]]),
+        })
 
-        col_map = {name: idx for idx, name in enumerate(columns)}
-        result = []
-        for row in rows:
-            result.append({
-                "timestamp": row[col_map["TRADEDATE"]],
-                "open": row[col_map["OPEN"]],
-                "high": row[col_map["HIGH"]],
-                "low": row[col_map["LOW"]],
-                "close": row[col_map["CLOSE"]],
-                "volume": row[col_map["VOLUME"]],
-            })
-
-        return jsonify({
-            "symbol": moex_symbol,
-            "interval": "1d",
-            "source": "MOEX",
-            "data": result
-        }), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    return jsonify({
+        "symbol": moex_symbol,
+        "interval": "1d",
+        "source": "MOEX",
+        "data": data
+    }), 200
 
 @assets_blueprint.route("/<symbol>/indicators", methods=["GET"])
 # @token_required

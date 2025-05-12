@@ -76,8 +76,8 @@ def register():
             return jsonify({"error": "Пользователь уже существует"}), 409
 
         cursor.execute(
-            "INSERT INTO users(username, email, password, created_at) VALUES(%s, %s, %s, %s)",
-            (username, email, password_hash, datetime.datetime.now())
+            "INSERT INTO users(username, email, password, created_at, graph_type_id) VALUES(%s, %s, %s, %s, %s)",
+            (username, email, password_hash, datetime.datetime.now(), 1)
         )
 
         conn.commit()

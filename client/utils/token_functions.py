@@ -1,8 +1,9 @@
-import sys
 import json
-import os
-from flask import request, jsonify
 import jwt
+import os
+import requests
+from functools import wraps
+from flask import Blueprint, jsonify, request
 
 from server.config import Config
 
@@ -32,8 +33,6 @@ def get_token():
         return None
 
 # def token_required(f):
-#     from functools import wraps
-#
 #     @wraps(f)
 #     def decorated(*args, **kwargs):
 #         token = None
