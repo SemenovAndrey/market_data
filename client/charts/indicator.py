@@ -70,7 +70,7 @@ def calculate_rsi(data: pd.DataFrame, period: int = 14) -> pd.Series:
 
     # Проверка на значения RSI
     if rsi.min() < 0 or rsi.max() > 100:
-        print("⚠️  ВНИМАНИЕ: Значения RSI вышли за допустимые границы (0-100).")
+        print("ВНИМАНИЕ: Значения RSI вышли за допустимые границы (0-100).")
 
     return rsi
 
@@ -90,6 +90,6 @@ def calculate_macd(data: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     # Проверка на малое отклонение MACD
     macd_range = macd_line.max() - macd_line.min()
     if macd_range < 0.1:
-        print(f"⚠️  ВНИМАНИЕ: MACD слишком мал. Диапазон: {macd_range}")
+        print(f"ВНИМАНИЕ: MACD слишком мал. Диапазон: {macd_range}")
 
     return macd_line, signal_line

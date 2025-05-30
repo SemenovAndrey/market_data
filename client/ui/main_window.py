@@ -1,15 +1,17 @@
 from PyQt5 import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
+from PyQt5.QtCore import QDate
 from PyQt5.QtWidgets import QPushButton
 from pyqtgraph import PlotWidget, DateAxisItem
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from statsmodels.tsa.arima.model import ARIMA
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 # from client.ui.profile_window import ProfileWindow
 # from client.ui.login_window import LoginWindow
@@ -27,7 +29,7 @@ from sklearn.preprocessing import MinMaxScaler
 # from keras.src.layers.core.dense import Dense
 # from keras.src.layers.rnn import rnn
 
-from client.utils.token_functions import load_token, save_token, TOKEN_FILE
+# from client.utils.token_functions import load_token, save_token, TOKEN_FILE
 
 from client.api.requests import get_asset_history
 from client.api.requests import get_forecasting_methods, get_indicator_names, get_indicator_data
@@ -52,6 +54,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.indicators_buttons = {}
         self.active_forecasts = {}
         self.forecasts_buttons = {}
+
+        self.clear_button = None
 
         self.setWindowTitle('Анализ графиков')
         self.resize(1200, 700)
@@ -274,6 +278,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.draw_graph()
 
     def draw_graph(self):
+        self.clear_active_tools()
+
         # график цен
         self.graph_area.clear()
 
@@ -352,11 +358,11 @@ class MainWindow(QtWidgets.QMainWindow):
             return [], []
 
     # ------------------------------------------------------------------------------------------------------------------
-    # LSTM TORCH v1.2
+    # LSTM TORCH v2.0
     # ------------------------------------------------------------------------------------------------------------------
-    def predict_lstm(self, y_values, x_values):
-        if len(y_values) < 60:
-            QtWidgets.QMessageBox.warning(self, "Недостаточно данных", "Для LSTM необходимо минимум 60 точек.")
+    def predict_lstm(self, y_values, x_values, forecast_steps=5):
+        if len(y_values) < 90:
+            QtWidgets.QMessageBox.warning(self, "Недостаточно данных", "Для LSTM необходимо минимум 90 точек ({len(y_values)}).")
             return [], []
 
         class LSTMModel(nn.Module):
@@ -384,16 +390,17 @@ class MainWindow(QtWidgets.QMainWindow):
         x_train = np.array([y_scaled[i - 60:i, 0] for i in range(60, len(y_scaled))])
         y_train = np.array([y_scaled[i, 0] for i in range(60, len(y_scaled))])
 
-        x_train = torch.tensor(x_train, dtype=torch.float32).unsqueeze(-1)  # (samples, 60, 1)
-        y_train = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)  # (samples, 1)
+        x_train = torch.tensor(x_train, dtype=torch.float32).unsqueeze(-1)
+        y_train = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
 
+        # Инициализация модели
         model = LSTMModel()
         criterion = nn.MSELoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
         # Обучение модели
         model.train()
-        for epoch in range(200):
+        for epoch in range(150):
             hidden = model.init_hidden(x_train.size(0))
             output, _ = model(x_train, hidden)
             loss = criterion(output, y_train)
@@ -403,30 +410,109 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Прогнозирование
         model.eval()
-        input_seq = torch.tensor(y_scaled[-60:].reshape(1, 60, 1), dtype=torch.float32)#.unsqueeze(0)#.unsqueeze(-1)  # (1, 60, 1)
+        input_seq = torch.tensor(y_scaled[-60:].reshape(1, 60, 1), dtype=torch.float32)
         hidden = model.init_hidden(1)
 
-        y_pred = []
-        for _ in range(5):
+        predictions = []
+        for _ in range(forecast_steps):
             with torch.no_grad():
-                # print(f"input_seq.shape: {input_seq.shape}")
-
                 next_val, hidden = model(input_seq, hidden)
                 next_val_scalar = next_val.item()
-                y_pred.append(next_val_scalar)
-
+                predictions.append(next_val_scalar)
                 next_tensor = torch.tensor([[[next_val_scalar]]], dtype=torch.float32)
                 input_seq = torch.cat((input_seq[:, 1:, :], next_tensor), dim=1)
 
-        # Обратное масштабирование
-        y_pred_rescaled = scaler.inverse_transform(np.array(y_pred).reshape(-1, 1)).flatten()
+        # Обратное преобразование данных
+        predictions_rescaled = scaler.inverse_transform(np.array(predictions).reshape(-1, 1)).flatten()
 
-        # Формирование временных меток для прогноза
+        # Формирование временных меток
         interval = x_values[-1] - x_values[-2]
-        x_pred = [x_values[-1] + (i + 1) * interval for i in range(5)]
+        x_pred = [x_values[-1] + (i + 1) * interval for i in range(forecast_steps)]
 
-        return x_pred, y_pred_rescaled.tolist()
+        return x_pred, predictions_rescaled.tolist()
     # ------------------------------------------------------------------------------------------------------------------
+
+    def predict_rnn(self, y_values, x_values, forecast_steps=5):
+        window_size = 90
+        if len(y_values) < window_size:
+            QtWidgets.QMessageBox.warning(
+                self, "Недостаточно данных",
+                f"Для RNN необходимо минимум {window_size} точек ({len(y_values)})."
+            )
+            return [], []
+
+        # Определяем модель
+        class RNNModel(nn.Module):
+            def __init__(self, input_size=1, hidden_size=64, num_layers=2):
+                super(RNNModel, self).__init__()
+                self.hidden_size = hidden_size
+                self.num_layers = num_layers
+                self.rnn = nn.RNN(input_size, hidden_size, num_layers,
+                                  batch_first=True, nonlinearity='tanh', dropout=0.2)
+                self.fc = nn.Linear(hidden_size, 1)
+
+            def forward(self, x, hidden):
+                out, hidden = self.rnn(x, hidden)
+                out = self.fc(out[:, -1, :])
+                return out, hidden
+
+            def init_hidden(self, batch_size):
+                # RNN не имеет состояния ячеек, только hidden
+                return torch.zeros(self.num_layers, batch_size, self.hidden_size)
+
+        # 1) нормализация
+        scaler = MinMaxScaler()
+        y_scaled = scaler.fit_transform(np.array(y_values).reshape(-1, 1))
+
+        # 2) готовим выборку: каждый sample — окно из 60 точек
+        x = []
+        y = []
+        for i in range(window_size, len(y_scaled)):
+            x.append(y_scaled[i - window_size:i, 0])
+            y.append(y_scaled[i, 0])
+        x = np.array(x)  # (N, 60)
+        y = np.array(y)  # (N,)
+
+        x_train = torch.tensor(x, dtype=torch.float32).unsqueeze(-1)  # (N, 60, 1)
+        y_train = torch.tensor(y, dtype=torch.float32).unsqueeze(1)  # (N, 1)
+
+        # 3) инициализируем модель, функцию потерь и оптимизатор
+        model = RNNModel()
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+        # 4) обучение
+        model.train()
+        for epoch in range(120):
+            hidden = model.init_hidden(x_train.size(0))
+            output, _ = model(x_train, hidden)
+            loss = criterion(output, y_train)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        # 5) прогноз
+        model.eval()
+        seq = torch.tensor(y_scaled[-window_size:].reshape(1, window_size, 1), dtype=torch.float32)
+        hidden = model.init_hidden(1)
+
+        preds = []
+        for _ in range(forecast_steps):
+            with torch.no_grad():
+                out, hidden = model(seq, hidden)
+                val = out.item()
+                preds.append(val)
+                new_input = torch.tensor([[[val]]], dtype=torch.float32)
+                seq = torch.cat((seq[:, 1:, :], new_input), dim=1)
+
+        # 6) обратное преобразование
+        preds = scaler.inverse_transform(np.array(preds).reshape(-1, 1)).flatten()
+
+        # 7) генерируем таймстемпы
+        interval = x_values[-1] - x_values[-2]
+        x_pred = [x_values[-1] + (i + 1) * interval for i in range(forecast_steps)]
+
+        return x_pred, preds.tolist()
 
     def draw_forecast(self):
         if not hasattr(self, "last_graph_data") or not self.last_graph_data\
@@ -442,29 +528,96 @@ class MainWindow(QtWidgets.QMainWindow):
         x = self.last_graph_data_xy["x"]
         y = self.last_graph_data_xy["y"]
 
-        if selected_model == "ARIMA":
-            x_pred, y_pred = self.predict_arima(y, x)
-            color = "g"
-        elif selected_model == "LSTM":
-            x_pred, y_pred = self.predict_lstm(y, x)
-            color = "r"
-        elif selected_model == "RNN":
-            QtWidgets.QMessageBox.information(self, "Модель", "Метод прогнозирования RNN пока не реализован.")
-            return
-        else:
-            QtWidgets.QMessageBox.information(self, "Модель", "Метод прогнозирования пока не реализован.")
-            return
+        try:
+            forecast_steps = 5
+            x_pred, y_pred = [], []
 
-        if x_pred and y_pred:
+            if selected_model in self.active_forecasts:
+                return
+
+            if selected_model == "ARIMA":
+                x_pred, y_pred = self.predict_arima(y, x)
+                color = "g"
+            elif selected_model == "LSTM":
+                # x_pred, y_pred = self.predict_lstm(y, x)
+                x_pred, y_pred = self.predict_lstm(y, x, forecast_steps)
+                color = "r"
+            elif selected_model == "RNN":
+                x_pred, y_pred = self.predict_rnn(y, x, forecast_steps)
+                color = "m"
+            else:
+                QtWidgets.QMessageBox.information(self, "Модель", "Метод прогнозирования пока не реализован.")
+                return
+
+            if not x_pred or not y_pred:
+                QtWidgets.QMessageBox.warning(self, "Модель", "Не удалось построить прогноз.")
+                return
+
             plot_item = self.graph_area.plot(
                 x_pred,
                 y_pred,
                 pen=pg.mkPen(color=color, style=QtCore.Qt.DashLine, width=2),
-                name="Прогноз"
+                name="Прогноз ({selected_model})"
             )
 
             self.update_active_forecasts(selected_model)
             self.active_forecasts[selected_model] = plot_item
+
+            if self.period_checkbox.isChecked():
+                end_date = self.end_date_edit.date().toPyDate()
+                # только если конец периода ≤ сегодня−forecast_steps:
+                if (datetime.now().date() - end_date).days >= forecast_steps:
+                    # 1) тянем ВСЕ торговые точки от end_date+1 до "сейчас"
+                    start_str = self.end_date_edit.date().toString("yyyy-MM-dd")
+                    end_str = QDate.currentDate().toString("yyyy-MM-dd")
+                    real = get_asset_history(self.current_symbol, params={"start": start_str, "end": end_str})
+
+                    # 2) берём ровно первые forecast_steps точек (API вернёт только торговые дни)
+                    real = real[1:forecast_steps]
+                    x_real = [datetime.fromisoformat(p["timestamp"]).timestamp() for p in real]
+                    y_real = [p["close"] for p in real]
+
+                    if not real:
+                        QtWidgets.QMessageBox.warning(
+                            self, "Недостаточно данных",
+                            "Не удалось получить ни одной точки реальных данных для оценки."
+                        )
+                    else:
+                        # 3) для расчёта метрик режем прогноз до длины реальных точек
+                        n = len(real)
+                        y_pred_cut = y_pred[:n]
+                        x_pred_cut = x_pred[:n]
+
+                        # Рисуем реальные
+                        self.graph_area.plot(
+                            x_real, y_real,
+                            pen=pg.mkPen(color="k", style=QtCore.Qt.DotLine, width=2),
+                            name="Реальные"
+                        )
+
+                        # 4) считаем метрики
+                        mae = mean_absolute_error(y_real, y_pred_cut)
+                        mse = mean_squared_error(y_real, y_pred_cut)
+                        rmse = np.sqrt(mse)
+                        mape = float(np.mean(
+                            np.abs((np.array(y_real) - np.array(y_pred_cut)) / np.array(y_real))
+                        ) * 100)
+
+                        # 5) выводим на график
+                        text = (f"MAE: {mae:.4f}\n"
+                                f"RMSE: {rmse:.4f}\n"
+                                f"MAPE: {mape:.2f}%")
+                        ti = pg.TextItem(text, anchor=(0, 1))
+                        ti.setPos(x_pred_cut[0], max(y_real + y_pred_cut))
+                        self.graph_area.addItem(ti)
+
+                        if n < forecast_steps:
+                            QtWidgets.QMessageBox.information(
+                                self, "Внимание",
+                                f"Получено только {n} реальных точек (из запрошенных {forecast_steps})."
+                            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ошибка прогнозирования", f"Ошибка при выполнении прогноза: {str(e)}")
 
             # if selected_model == "ARIMA":
             #     self.update_active_forecasts("ARIMA")
@@ -614,22 +767,21 @@ class MainWindow(QtWidgets.QMainWindow):
             button = self.indicators_buttons.pop(name)
             self.active_tools_layout.removeWidget(button)
 
-        # self.remove_clear_button()
+        self.remove_clear_button()
 
     def clear_indicators(self):
         for name in list(self.active_indicators.keys()):
             self.remove_indicator(name)
 
-        # self.remove_clear_button()
+        self.remove_clear_button()
 
     def update_active_indicators(self, name: str):
-        # self.add_clear_button()
+        self.add_clear_button()
 
         if name not in self.active_indicators:
             button = QtWidgets.QPushButton(f"{name} (Удалить)")
             button.setObjectName(name)
             button.clicked.connect(lambda _, n=name: self.remove_indicator(n))
-            # self.active_indicators[name] = button
             self.indicators_buttons[name] = button
             self.active_tools_layout.addWidget(button)
             self.active_tools_layout.setSpacing(5)
@@ -643,16 +795,16 @@ class MainWindow(QtWidgets.QMainWindow):
             button = self.forecasts_buttons.pop(name)
             self.active_tools_layout.removeWidget(button)
 
-        # self.remove_clear_button()
+        self.remove_clear_button()
 
     def clear_forecasts(self):
         for name in list(self.active_forecasts.keys()):
             self.remove_forecast(name)
 
-        # self.remove_clear_button()
+        self.remove_clear_button()
 
     def update_active_forecasts(self, name: str):
-        # self.add_clear_button()
+        self.add_clear_button()
 
         if name not in self.active_indicators:
             button = QtWidgets.QPushButton(f"{name} (Удалить)")
@@ -662,19 +814,21 @@ class MainWindow(QtWidgets.QMainWindow):
             self.active_tools_layout.addWidget(button)
             self.active_tools_layout.setSpacing(5)
 
-    # def add_clear_button(self):
-    #     if self.active_indicators.__len__() == 0 and self.active_forecasts.__len__() == 0:
-    #         button = QtWidgets.QPushButton(f"Очистить все инструменты")
-    #         button.setObjectName("delete_button")
-    #         button.clicked.connect(self.clear_active_tools)
-    #         self.active_tools_layout.addWidget(button)
-    #         self.active_tools_layout.setSpacing(15)
-    #
-    # def remove_clear_button(self):
-    #     if self.active_indicators.__len__() == 0 and self.active_forecasts.__len__() == 0:
-    #         button = self.active_tools_layout.findChild(QPushButton, "delete_button")
-    #         self.active_tools_layout.removeWidget(button)
-    #
-    # def clear_active_tools(self):
-    #     self.clear_indicators()
-    #     self.clear_forecasts()
+    def add_clear_button(self):
+        if self.active_indicators.__len__() == 0 and self.active_forecasts.__len__() == 0:
+            self.clear_button = QtWidgets.QPushButton(f"Очистить все инструменты")
+            self.clear_button.setObjectName("delete_button")
+            self.clear_button.clicked.connect(self.clear_active_tools)
+            self.active_tools_layout.addWidget(self.clear_button)
+            self.active_tools_layout.setSpacing(15)
+
+    def remove_clear_button(self):
+        if self.active_indicators.__len__() == 0 and self.active_forecasts.__len__() == 0:
+            # button = self.active_tools_layout.findChild(QPushButton, "delete_button")
+            button = self.clear_button
+            self.clear_button = None
+            self.active_tools_layout.removeWidget(button)
+
+    def clear_active_tools(self):
+        self.clear_indicators()
+        self.clear_forecasts()
